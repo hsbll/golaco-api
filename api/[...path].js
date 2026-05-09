@@ -1,8 +1,8 @@
 // ============================================================
 //  Golaço API — Vercel Serverless (Node.js runtime)
 //  Substituto do Cloudflare Worker. Mesmas rotas que o app.min.js
-//  já consome. Roda em AWS Lambda (iad1 por padrão), evitando o
-//  bloqueio cross-zone da Cloudflare ao chamar 365scores/Sofascore.
+//  já consome. Roda em AWS Lambda, evitando o bloqueio cross-zone
+//  da Cloudflare ao chamar 365scores/Sofascore.
 // ============================================================
 
 // ── Config ─────────────────────────────────────────────────
@@ -28,12 +28,11 @@ const TTL_MS = {
   standings: 600_000,
   sfLive:    15_000,
   sfEvent:   20_000,
-  resultsHistorical: 3_600_000, // dias passados são imutáveis
+  resultsHistorical: 3_600_000,
 };
 
-const FETCH_TIMEOUT_MS = 9000; // hobby plan tem 10s de wall time
+const FETCH_TIMEOUT_MS = 9000;
 
-// Headers de browser real — sem assinatura de bot.
 const BROWSER_HEADERS_365 = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -53,10 +52,7 @@ const BROWSER_HEADERS_SF = {
   "Origin":  "https://www.sofascore.com",
 };
 
-// ── Cache em memória (por instância) ──────────────────────
-// Vercel Fluid Compute mantém instâncias quentes; cache acerta
-// entre requests no mesmo container. Não é distribuído — para
-// um hobby project, é mais que suficiente.
+// ── Cache em memória ─────────────────────────────────────
 const cache = new Map();
 
 function cacheGet(key) {
@@ -91,8 +87,6 @@ async function fetchWithTimeout(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
   }
 }
 
-// Fetch JSON com diagnóstico real de falhas. Retorna o JSON OK
-// ou um objeto { _error, status, statusText, bodyHint } se falhou.
 async function fetchJson(url, headers) {
   const res = await fetchWithTimeout(url, { headers });
   if (res._exception) {
@@ -100,14 +94,14 @@ async function fetchJson(url, headers) {
   }
   if (!res.ok) {
     let bodyHint = "";
-    try { bodyHint = (await res.text()).slice(0, 240); } catch { /* noop */ }
+    try { bodyHint = (await res.text()).slice(0, 240); } catch {}
     return { _error: true, status: res.status, statusText: res.statusText, bodyHint };
   }
   try {
     return await res.json();
   } catch {
     let bodyHint = "";
-    try { bodyHint = (await res.clone().text()).slice(0, 240); } catch { /* noop */ }
+    try { bodyHint = (await res.clone().text()).slice(0, 240); } catch {}
     return {
       _error: true,
       status: 502,
@@ -156,7 +150,6 @@ function send(res, status, data, extra = {}) {
   res.status(status).send(JSON.stringify(data));
 }
 
-// Wrap producer com cache. Producer retorna { status, body }.
 async function cached(key, ttlMs, producer) {
   const hit = cacheGet(key);
   if (hit) return { ...hit, _cache: "HIT" };
@@ -170,7 +163,7 @@ function todayBR() {
   return br.toISOString().slice(0, 10);
 }
 
-// ── Producers (lógica de cada rota) ───────────────────────
+// ── Producers ─────────────────────────────────────────────
 async function produceLive() {
   const data = await apiFetch("/games/");
   if (data._error) return { status: 502, body: { error: "upstream_365", ...data } };
@@ -196,15 +189,12 @@ async function produceStats(gameId) {
     fetchStats(gameId),
     fetchGame(gameId, gameId),
   ]);
-
-  // Se ambos falharem, propaga 502. Se só um falhar, monta o que dá.
   if (statsResp._error && gameResp._error) {
     return {
       status: 502,
       body: { error: "upstream_365", stats: statsResp, game: gameResp },
     };
   }
-
   return {
     status: 200,
     body: {
@@ -261,7 +251,6 @@ async function produceSfEvent(sfId, sub) {
   };
 }
 
-// Diagnóstico cru — sem cache, sem mascarar nada.
 async function produceDebug(targetUrl) {
   const url = targetUrl || `${WS}/games/?${PARAMS}&competitions=${COMP_IDS}`;
   const isSf = url.includes("sofascore.com");
@@ -293,7 +282,6 @@ async function produceDebug(targetUrl) {
 
 // ── Router ────────────────────────────────────────────────
 export default async function handler(req, res) {
-  // Preflight
   if (req.method === "OPTIONS") {
     for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v);
     res.status(204).end();
@@ -304,22 +292,26 @@ export default async function handler(req, res) {
     return send(res, 405, { error: "method not allowed" });
   }
 
-  // Vercel passa o catch-all como req.query.path
-  const segs = Array.isArray(req.query.path)
-    ? req.query.path
-    : (req.query.path ? [req.query.path] : []);
-  const route = "/" + segs.join("/");
-  const cacheKey = req.url; // inclui querystring → bom como chave
+  // Parseia path e query direto da URL — req.query.path do catch-all
+  // não é confiável no Node runtime do Vercel.
+  const urlObj  = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const apiPath = urlObj.pathname.replace(/^\/api/, "") || "/";
+  const segs    = apiPath.split("/").filter(Boolean);
+  const route   = "/" + segs.join("/");
+  const q       = Object.fromEntries(urlObj.searchParams);
+  const cacheKey = req.url;
 
   try {
-    // Health
     if (route === "/" || route === "/health") {
       return send(res, 200, {
         ok: true,
         service: "golaco-api",
-        version: "3.0-vercel",
+        version: "3.1-vercel",
         runtime: "node",
+        debugRoute: route,
+        debugSegs: segs,
         endpoints: [
+          "/api/health",
           "/api/live",
           "/api/results?from=DD/MM/YYYY&to=DD/MM/YYYY",
           "/api/upcoming?from=&to=",
@@ -333,29 +325,27 @@ export default async function handler(req, res) {
       });
     }
 
-    // Debug — sem cache, sem mascarar
     if (route === "/_debug") {
-      const r = await produceDebug(req.query.u || "");
+      const r = await produceDebug(q.u || "");
       return send(res, r.status, r.body);
     }
 
-    // 365scores
     if (route === "/live") {
       const r = await cached(cacheKey, TTL_MS.live, produceLive);
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
 
     if (route === "/results") {
-      const from = req.query.from || "";
-      const to   = req.query.to   || "";
+      const from = q.from || "";
+      const to   = q.to   || "";
       const ttl  = (from && to) ? TTL_MS.resultsHistorical : TTL_MS.results;
       const r = await cached(cacheKey, ttl, () => produceResults(from, to));
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
 
     if (route === "/upcoming") {
-      const from = req.query.from || "";
-      const to   = req.query.to   || "";
+      const from = q.from || "";
+      const to   = q.to   || "";
       const r = await cached(cacheKey, TTL_MS.upcoming, () => produceUpcoming(from, to));
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
@@ -368,20 +358,19 @@ export default async function handler(req, res) {
     }
 
     if (route === "/standings") {
-      const comp = String(req.query.comp || "113");
+      const comp = String(q.comp || "113");
       if (!/^\d+$/.test(comp)) return send(res, 400, { error: "invalid comp" });
       const r = await cached(cacheKey, TTL_MS.standings, () => produceStandings(comp));
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
 
-    // Sofascore
     if (route === "/sf/live") {
       const r = await cached(cacheKey, TTL_MS.sfLive, produceSfLive);
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
 
     if (route === "/sf/scheduled") {
-      const date = String(req.query.date || todayBR());
+      const date = String(q.date || todayBR());
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return send(res, 400, { error: "invalid date" });
       const r = await cached(cacheKey, TTL_MS.upcoming, () => produceSfScheduled(date));
       return send(res, r.status, r.body, { "X-Cache": r._cache });
@@ -395,7 +384,7 @@ export default async function handler(req, res) {
       return send(res, r.status, r.body, { "X-Cache": r._cache });
     }
 
-    return send(res, 404, { error: "not found", path: route });
+    return send(res, 404, { error: "not found", route, segs });
   } catch (err) {
     return send(res, 500, { error: "internal", message: err?.message || String(err) });
   }
