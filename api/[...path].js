@@ -1,19 +1,12 @@
 // ============================================================
-//  Golaço API — Vercel Serverless v4.0
-//  Node.js 20 · ES Modules (package.json precisa "type":"module")
+//  Golaço API — Vercel Serverless v5.0
+//  Fonte primária: Supabase (banco)
+//  Fallback: 365scores (quando banco vazio ou falhar)
 //
-//  Problemas corrigidos vs v3.1:
-//  [1] standings: endpoint /stats/ → /standings/ (bug crítico)
-//  [2] package.json: adicionado "type":"module"
-//  [3] Producers: try/catch individual em cada um
-//  [4] Cache: evicção LRU correta + sem cache de erros
-//  [5] Inputs: sanitização e limites em todos os params
-//  [6] fetchJson: clone antes de .text() em fallback
-//  [7] Rate limit simples por IP (evita abuso)
-//  [8] Headers de segurança em todas as respostas
-//  [9] /api/live: cobre statusGroup=4 no log de debug
-//  [10] produceStats: matchupId separado de gameId
-//  [11] Logs estruturados para facilitar debug no Vercel
+//  Variáveis de ambiente necessárias no Vercel:
+//    SUPABASE_URL          = https://tdrpigbhbwosairjuzdq.supabase.co
+//    SUPABASE_SERVICE_KEY  = eyJhbGci... (service_role key)
+//    ALLOWED_ORIGIN        = * (ou domínio específico)
 // ============================================================
 
 // ── Competições ───────────────────────────────────────────
@@ -27,28 +20,28 @@ const COMPETITIONS = {
 };
 const COMP_IDS = Object.keys(COMPETITIONS).join(",");
 
-// ── Endpoints upstream ────────────────────────────────────
+// ── Endpoints upstream (fallback) ─────────────────────────
 const WS      = "https://webws.365scores.com/web";
 const PARAMS  = "langId=31&timezoneName=America/Sao_Paulo&userCountryId=21&appTypeId=5";
 const SF_BASE = "https://api.sofascore.com/api/v1";
 
-// ── TTLs de cache (ms) ────────────────────────────────────
+// ── TTLs de cache em memória (ms) ────────────────────────
 const TTL = {
-  live:               10_000,   // 10s  — muda durante jogo
-  results:           120_000,   // 2min — muda quando jogo termina
-  resultsHistorical: 3_600_000, // 1h   — passado é imutável
-  upcoming:          300_000,   // 5min — agenda muda pouco
-  stats:              15_000,   // 15s  — muda durante jogo
-  standings:         600_000,   // 10min — muda 1x por rodada
+  live:               10_000,
+  results:           120_000,
+  resultsHistorical: 3_600_000,
+  upcoming:          300_000,
+  stats:              15_000,
+  standings:         300_000,  // 5min — banco atualiza 1x/dia
   sfLive:             15_000,
   sfEvent:            20_000,
 };
 
-const FETCH_TIMEOUT_MS = 9_000; // 9s (Vercel Hobby tem 10s de limit)
-const RATE_LIMIT_WINDOW_MS = 10_000; // janela de 10s por IP
-const RATE_LIMIT_MAX = 30;           // máx 30 req/10s por IP
+const FETCH_TIMEOUT_MS = 9_000;
+const RATE_LIMIT_WINDOW_MS = 10_000;
+const RATE_LIMIT_MAX = 30;
 
-// ── Headers de browser realistas ─────────────────────────
+// ── Headers browser ───────────────────────────────────────
 const H365 = {
   "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept":          "application/json, text/plain, */*",
@@ -66,27 +59,22 @@ const HSF = {
   "Origin":  "https://www.sofascore.com",
 };
 
-// ── Cache em memória (LRU simplificado) ───────────────────
-// AVISO: reseta a cada cold start no Vercel Hobby.
-// Mesmo assim reduz latência em instâncias quentes.
+// ── Cache em memória ──────────────────────────────────────
 const _cache = new Map();
 
 function cacheGet(key) {
   const e = _cache.get(key);
   if (!e) return null;
   if (Date.now() > e.expires) { _cache.delete(key); return null; }
-  // Move para o fim (LRU)
   _cache.delete(key);
   _cache.set(key, e);
   return e.value;
 }
 
 function cacheSet(key, value, ttlMs) {
-  // Nunca armazena erros
   if (value?._error) return;
-  _cache.delete(key); // garante ordem LRU
+  _cache.delete(key);
   _cache.set(key, { value, expires: Date.now() + ttlMs });
-  // Evicção: remove o mais antigo quando passa de 150 entradas
   if (_cache.size > 150) {
     const oldest = _cache.keys().next().value;
     if (oldest) _cache.delete(oldest);
@@ -101,25 +89,23 @@ async function withCache(key, ttlMs, producer) {
   return { ...fresh, _cache: "MISS" };
 }
 
-// ── Rate limiter por IP ───────────────────────────────────
+// ── Rate limiter ──────────────────────────────────────────
 const _rl = new Map();
 
 function isRateLimited(ip) {
   const now = Date.now();
-  const entry = _rl.get(ip) || { count: 0, start: now };
-  if (now - entry.start > RATE_LIMIT_WINDOW_MS) {
+  const e = _rl.get(ip) || { count: 0, start: now };
+  if (now - e.start > RATE_LIMIT_WINDOW_MS) {
     _rl.set(ip, { count: 1, start: now });
     return false;
   }
-  entry.count++;
-  _rl.set(ip, entry);
-  // Limpeza periódica do mapa
+  e.count++;
+  _rl.set(ip, e);
   if (_rl.size > 1000) {
-    for (const [k, v] of _rl) {
+    for (const [k, v] of _rl)
       if (now - v.start > RATE_LIMIT_WINDOW_MS * 2) _rl.delete(k);
-    }
   }
-  return entry.count > RATE_LIMIT_MAX;
+  return e.count > RATE_LIMIT_MAX;
 }
 
 // ── HTTP helpers ──────────────────────────────────────────
@@ -129,11 +115,7 @@ async function fetchWithTimeout(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
   try {
     return await fetch(url, { ...opts, signal: ctl.signal });
   } catch (err) {
-    return {
-      _exception: err?.name === "AbortError" ? `timeout_${ms}ms` : (err?.message || String(err)),
-      ok: false,
-      status: 0,
-    };
+    return { _exception: err?.name === "AbortError" ? `timeout_${ms}ms` : (err?.message || String(err)), ok: false, status: 0 };
   } finally {
     clearTimeout(tid);
   }
@@ -141,63 +123,75 @@ async function fetchWithTimeout(url, opts = {}, ms = FETCH_TIMEOUT_MS) {
 
 async function fetchJson(url, headers) {
   const res = await fetchWithTimeout(url, { headers });
-
-  // Timeout ou erro de rede
-  if (res._exception) {
-    log("warn", "fetch_exception", { url, err: res._exception });
-    return { _error: true, status: 504, reason: res._exception };
-  }
-
-  // Resposta HTTP de erro
+  if (res._exception) return { _error: true, status: 504, reason: res._exception };
   if (!res.ok) {
     let hint = "";
     try { hint = (await res.text()).slice(0, 200); } catch {}
-    log("warn", "fetch_http_error", { url, status: res.status, hint });
     return { _error: true, status: res.status, reason: res.statusText, hint };
   }
-
-  // Parse JSON
-  try {
-    return await res.json();
-  } catch {
+  try { return await res.json(); }
+  catch {
     let hint = "";
     try { hint = (await res.clone().text()).slice(0, 200); } catch {}
-    log("warn", "fetch_json_parse", { url, hint });
     return { _error: true, status: 502, reason: "non_json_response", hint };
   }
 }
 
-// ── Wrappers 365scores ────────────────────────────────────
+// ── Supabase client simples (sem SDK, evita cold start pesado) ──
+function sbHeaders() {
+  return {
+    "apikey":        process.env.SUPABASE_SERVICE_KEY || "",
+    "Authorization": `Bearer ${process.env.SUPABASE_SERVICE_KEY || ""}`,
+    "Content-Type":  "application/json",
+  };
+}
+
+async function sbQuery(path) {
+  const base = process.env.SUPABASE_URL;
+  if (!base || !process.env.SUPABASE_SERVICE_KEY) return null;
+  const res = await fetchWithTimeout(`${base}/rest/v1${path}`, { headers: sbHeaders() }, 5000);
+  if (!res.ok) return null;
+  try { return await res.json(); } catch { return null; }
+}
+
+// ── Patch de jogos: sobrescreve score/status do banco no raw ─
+// O raw pode estar desatualizado — o banco tem o valor mais recente
+function patchGame(row) {
+  const g = { ...row.raw };  // copia o objeto original da 365scores
+  // Sobrescreve com os valores mais atuais gravados pelo collect-live
+  if (row.home_score !== null && row.home_score !== undefined) {
+    if (g.homeCompetitor) g.homeCompetitor = { ...g.homeCompetitor, score: row.home_score };
+  }
+  if (row.away_score !== null && row.away_score !== undefined) {
+    if (g.awayCompetitor) g.awayCompetitor = { ...g.awayCompetitor, score: row.away_score };
+  }
+  // Injeta minuto atualizado como gameTime
+  if (row.minute && row.minute !== "INTERVALO") {
+    const m = parseInt(row.minute);
+    if (!isNaN(m)) g.gameTime = m;
+  }
+  // Garante que statusId ao vivo seja consistente com o status do banco
+  if (row.status === "live" && g.statusGroup !== 6) g.statusGroup = 6;
+  if (row.status === "finished" && g.statusGroup !== 4) g.statusGroup = 4;
+  return g;
+}
+
+// ── Wrappers 365scores (fallback) ─────────────────────────
 const api365 = (path, extra = "") =>
-  fetchJson(
-    `${WS}${path}?${PARAMS}&competitions=${COMP_IDS}${extra ? `&${extra}` : ""}`,
-    H365
-  );
+  fetchJson(`${WS}${path}?${PARAMS}&competitions=${COMP_IDS}${extra ? `&${extra}` : ""}`, H365);
 
 const fetchGameDetail = (gameId, matchupId) =>
-  fetchJson(
-    `${WS}/game/?${PARAMS}&gameId=${gameId}&matchupId=${matchupId ?? gameId}&topBookmaker=14`,
-    H365
-  );
+  fetchJson(`${WS}/game/?${PARAMS}&gameId=${gameId}&matchupId=${matchupId ?? gameId}&topBookmaker=14`, H365);
 
 const fetchGameStats = (gameId) =>
   fetchJson(`${WS}/game/stats/?${PARAMS}&games=${gameId}`, H365);
 
-// [FIX 1] standings usa /standings/ e não /stats/
-const fetchStandings = (comp) =>
+const fetchStandings365 = (comp) =>
   fetchJson(`${WS}/standings/?${PARAMS}&competitions=${comp}`, H365);
 
-// ── Wrapper Sofascore ─────────────────────────────────────
 const sfFetch = (path) => fetchJson(`${SF_BASE}${path}`, HSF);
 
-// ── Logger estruturado ────────────────────────────────────
-function log(level, event, data = {}) {
-  console[level === "error" ? "error" : level === "warn" ? "warn" : "log"](
-    JSON.stringify({ ts: new Date().toISOString(), level, event, ...data })
-  );
-}
-
-// ── Headers de resposta ───────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin":  process.env.ALLOWED_ORIGIN || "*",
@@ -207,7 +201,7 @@ function corsHeaders() {
   };
 }
 
-function securityHeaders() {
+function secHeaders() {
   return {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options":        "DENY",
@@ -216,31 +210,57 @@ function securityHeaders() {
 }
 
 function send(res, status, data, extra = {}) {
-  const body = JSON.stringify(data);
   const headers = {
     "Content-Type":  "application/json; charset=utf-8",
     "Cache-Control": "private, no-store",
     ...corsHeaders(),
-    ...securityHeaders(),
+    ...secHeaders(),
     ...extra,
   };
   for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
-  res.status(status).send(body);
+  res.status(status).send(JSON.stringify(data));
 }
 
-// ── Validação de inputs ───────────────────────────────────
+function log(level, event, data = {}) {
+  console[level === "error" ? "error" : level === "warn" ? "warn" : "log"](
+    JSON.stringify({ ts: new Date().toISOString(), level, event, ...data })
+  );
+}
+
+function todayBR() {
+  return new Date(Date.now() - 3 * 3_600_000).toISOString().slice(0, 10);
+}
+
+function dateBR(offsetDays = 0) {
+  const ms = Date.now() - 3 * 3_600_000 + offsetDays * 86_400_000;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
 const VALID_ID   = /^\d{1,12}$/;
 const VALID_COMP = /^\d{1,6}$/;
 const VALID_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const VALID_FROM = /^\d{2}\/\d{2}\/\d{4}$/;
 
-// ── Producers ─────────────────────────────────────────────
+// ── Producers com banco + fallback ────────────────────────
 
 async function produceLive() {
   try {
+    // Tenta banco primeiro
+    const rows = await sbQuery(
+      "/games?status=eq.live&select=id,home_score,away_score,minute,status,raw&order=start_time.asc"
+    );
+
+    if (rows?.length) {
+      const games = rows.filter(r => r.raw).map(patchGame);
+      log("info", "live_from_db", { count: games.length });
+      return { status: 200, body: { games, _source: "db" } };
+    }
+
+    // Fallback: 365scores
+    log("info", "live_fallback_365");
     const data = await api365("/games/");
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_365", ...data } };
-    return { status: 200, body: { games: data.games ?? [] } };
+    return { status: 200, body: { games: data.games ?? [], _source: "365" } };
   } catch (e) {
     log("error", "produceLive", { err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
@@ -249,10 +269,36 @@ async function produceLive() {
 
 async function produceResults(from, to) {
   try {
+    // Banco: últimos 7 dias se sem filtro, ou filtro de data convertido
+    let dbFilter = "/games?status=eq.finished&select=id,home_score,away_score,minute,status,raw&order=start_time.desc&limit=200";
+
+    if (from && to) {
+      // Converter DD/MM/YYYY para ISO
+      const [df, mf, yf] = from.split("/");
+      const [dt, mt, yt] = to.split("/");
+      const isoFrom = `${yf}-${mf}-${df}T00:00:00`;
+      const isoTo   = `${yt}-${mt}-${dt}T23:59:59`;
+      dbFilter += `&start_time=gte.${isoFrom}&start_time=lte.${isoTo}`;
+    } else {
+      // Sem filtro: últimos 7 dias
+      const since = dateBR(-7) + "T00:00:00";
+      dbFilter += `&start_time=gte.${since}`;
+    }
+
+    const rows = await sbQuery(dbFilter);
+
+    if (rows?.length) {
+      const games = rows.filter(r => r.raw).map(patchGame);
+      log("info", "results_from_db", { count: games.length });
+      return { status: 200, body: { games, _source: "db" } };
+    }
+
+    // Fallback: 365scores
+    log("info", "results_fallback_365");
     const extra = from && to ? `startDate=${from}&endDate=${to}` : "";
     const data  = await api365("/games/results/", extra);
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_365", ...data } };
-    return { status: 200, body: { games: data.games ?? [] } };
+    return { status: 200, body: { games: data.games ?? [], _source: "365" } };
   } catch (e) {
     log("error", "produceResults", { err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
@@ -261,10 +307,34 @@ async function produceResults(from, to) {
 
 async function produceUpcoming(from, to) {
   try {
+    let dbFilter = "/games?status=eq.scheduled&select=id,home_score,away_score,minute,status,raw&order=start_time.asc&limit=200";
+
+    if (from && to) {
+      const [df, mf, yf] = from.split("/");
+      const [dt, mt, yt] = to.split("/");
+      const isoFrom = `${yf}-${mf}-${df}T00:00:00`;
+      const isoTo   = `${yt}-${mt}-${dt}T23:59:59`;
+      dbFilter += `&start_time=gte.${isoFrom}&start_time=lte.${isoTo}`;
+    } else {
+      const since = dateBR(0) + "T00:00:00";
+      const until = dateBR(7) + "T23:59:59";
+      dbFilter += `&start_time=gte.${since}&start_time=lte.${until}`;
+    }
+
+    const rows = await sbQuery(dbFilter);
+
+    if (rows?.length) {
+      const games = rows.filter(r => r.raw).map(patchGame);
+      log("info", "upcoming_from_db", { count: games.length });
+      return { status: 200, body: { games, _source: "db" } };
+    }
+
+    // Fallback: 365scores
+    log("info", "upcoming_fallback_365");
     const extra = from && to ? `startDate=${from}&endDate=${to}` : "";
     const data  = await api365("/games/", extra);
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_365", ...data } };
-    return { status: 200, body: { games: data.games ?? [] } };
+    return { status: 200, body: { games: data.games ?? [], _source: "365" } };
   } catch (e) {
     log("error", "produceUpcoming", { err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
@@ -273,15 +343,12 @@ async function produceUpcoming(from, to) {
 
 async function produceStats(gameId) {
   try {
-    // [FIX 10] matchupId pode diferir do gameId — buscamos separado
     const [statsResp, gameResp] = await Promise.all([
       fetchGameStats(gameId),
       fetchGameDetail(gameId, gameId),
     ]);
     const bothFailed = statsResp._error && gameResp._error;
-    if (bothFailed) {
-      return { _error: true, status: 502, body: { error: "upstream_365", stats: statsResp, game: gameResp } };
-    }
+    if (bothFailed) return { _error: true, status: 502, body: { error: "upstream_365" } };
     return {
       status: 200,
       body: {
@@ -298,10 +365,21 @@ async function produceStats(gameId) {
 
 async function produceStandings(comp) {
   try {
-    // [FIX 1] endpoint correto: /standings/ em vez de /stats/
-    const data = await fetchStandings(comp);
+    // Banco: snapshot mais recente para essa competição
+    const rows = await sbQuery(
+      `/standings_snapshots?competition_id=eq.${comp}&select=raw,snapshot_date&order=snapshot_date.desc&limit=1`
+    );
+
+    if (rows?.[0]?.raw) {
+      log("info", "standings_from_db", { comp, date: rows[0].snapshot_date });
+      return { status: 200, body: { ...rows[0].raw, _source: "db", _date: rows[0].snapshot_date } };
+    }
+
+    // Fallback: 365scores
+    log("info", "standings_fallback_365", { comp });
+    const data = await fetchStandings365(comp);
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_365", ...data } };
-    return { status: 200, body: data };
+    return { status: 200, body: { ...data, _source: "365" } };
   } catch (e) {
     log("error", "produceStandings", { comp, err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
@@ -314,7 +392,6 @@ async function produceSfLive() {
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_sf", ...data } };
     return { status: 200, body: data };
   } catch (e) {
-    log("error", "produceSfLive", { err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
   }
 }
@@ -325,7 +402,6 @@ async function produceSfScheduled(date) {
     if (data._error) return { _error: true, status: 502, body: { error: "upstream_sf", ...data } };
     return { status: 200, body: data };
   } catch (e) {
-    log("error", "produceSfScheduled", { date, err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
   }
 }
@@ -345,36 +421,36 @@ async function produceSfEvent(sfId, sub) {
       sfFetch(`/event/${sfId}/h2h`),
     ]);
     const val = (r) => r.status === "fulfilled" && !r.value?._error ? r.value : null;
-    return {
-      status: 200,
-      body: { event: val(event), stats: val(stats), momentum: val(momentum), odds: val(odds), h2h: val(h2h) },
-    };
+    return { status: 200, body: { event: val(event), stats: val(stats), momentum: val(momentum), odds: val(odds), h2h: val(h2h) } };
   } catch (e) {
-    log("error", "produceSfEvent", { sfId, err: e.message });
     return { _error: true, status: 500, body: { error: "internal" } };
   }
 }
 
 async function produceDebug(targetUrl) {
   try {
-    const url     = targetUrl || `${WS}/games/?${PARAMS}&competitions=${COMP_IDS}`;
-    const isSf    = url.includes("sofascore.com");
+    const url = targetUrl || `${WS}/games/?${PARAMS}&competitions=${COMP_IDS}`;
+    const isSf = url.includes("sofascore.com");
     const headers = isSf ? HSF : H365;
-    const res     = await fetchWithTimeout(url, { headers });
+    const res = await fetchWithTimeout(url, { headers });
     if (res._exception) return { status: 200, body: { url, fetchFailed: true, error: res._exception } };
     let body = "";
     try { body = await res.text(); } catch (e) { body = `<read_error: ${e.message}>`; }
+
+    // Também mostrar status do banco
+    const dbStatus = {
+      supabase_url: process.env.SUPABASE_URL ? "✅ configurado" : "❌ não configurado",
+      supabase_key:  process.env.SUPABASE_SERVICE_KEY ? "✅ configurado" : "❌ não configurado",
+    };
+
     return {
       status: 200,
       body: {
-        url,
-        httpStatus:    res.status,
-        statusText:    res.statusText,
-        bodyLength:    body.length,
-        bodyIsHtml:    body.trim().startsWith("<"),
-        bodyIsJson:    (() => { try { JSON.parse(body); return true; } catch { return false; } })(),
-        bodyHead:      body.slice(0, 800),
-        responseHeaders: Object.fromEntries(res.headers ?? []),
+        url, httpStatus: res.status, bodyLength: body.length,
+        bodyIsHtml: body.trim().startsWith("<"),
+        bodyIsJson: (() => { try { JSON.parse(body); return true; } catch { return false; } })(),
+        bodyHead: body.slice(0, 600),
+        db: dbStatus,
       },
     };
   } catch (e) {
@@ -382,42 +458,24 @@ async function produceDebug(targetUrl) {
   }
 }
 
-// ── Helper: data atual no fuso Brasil ────────────────────
-function todayBR() {
-  return new Date(Date.now() - 3 * 3_600_000).toISOString().slice(0, 10);
-}
-
-// ── Router principal ──────────────────────────────────────
+// ── Router ────────────────────────────────────────────────
 export default async function handler(req, res) {
   const t0 = Date.now();
 
-  // ── CORS preflight ──────────────────────────────────────
   if (req.method === "OPTIONS") {
-    for (const [k, v] of Object.entries({ ...corsHeaders(), ...securityHeaders() })) {
-      res.setHeader(k, v);
-    }
+    for (const [k, v] of Object.entries({ ...corsHeaders(), ...secHeaders() })) res.setHeader(k, v);
     res.status(204).end();
     return;
   }
 
-  // ── Só GET ─────────────────────────────────────────────
-  if (req.method !== "GET") {
-    return send(res, 405, { error: "method_not_allowed" });
-  }
+  if (req.method !== "GET") return send(res, 405, { error: "method_not_allowed" });
 
-  // ── Rate limit ──────────────────────────────────────────
   const ip = (req.headers["x-forwarded-for"] || "unknown").split(",")[0].trim();
-  if (isRateLimited(ip)) {
-    return send(res, 429, { error: "rate_limit_exceeded" });
-  }
+  if (isRateLimited(ip)) return send(res, 429, { error: "rate_limit_exceeded" });
 
-  // ── Parseia rota ────────────────────────────────────────
   let urlObj;
-  try {
-    urlObj = new URL(req.url, `https://${req.headers.host || "localhost"}`);
-  } catch {
-    return send(res, 400, { error: "invalid_url" });
-  }
+  try { urlObj = new URL(req.url, `https://${req.headers.host || "localhost"}`); }
+  catch { return send(res, 400, { error: "invalid_url" }); }
 
   const apiPath  = urlObj.pathname.replace(/^\/api/, "") || "/";
   const segs     = apiPath.split("/").filter(Boolean);
@@ -425,69 +483,53 @@ export default async function handler(req, res) {
   const q        = Object.fromEntries(urlObj.searchParams);
   const cacheKey = urlObj.pathname + urlObj.search;
 
-  log("info", "request", { route, ip, method: req.method });
+  log("info", "req", { route, ip });
 
   try {
-    // ── Health ────────────────────────────────────────────
     if (route === "/" || route === "/health") {
       return send(res, 200, {
-        ok:      true,
-        service: "golaco-api",
-        version: "4.0",
-        runtime: "node20-esm",
-        ts:      new Date().toISOString(),
+        ok: true, service: "golaco-api", version: "5.0",
+        runtime: "node20-esm", ts: new Date().toISOString(),
+        db: process.env.SUPABASE_URL ? "connected" : "not_configured",
         endpoints: [
-          "GET /api/health",
-          "GET /api/live",
+          "GET /api/health", "GET /api/live",
           "GET /api/results?from=DD/MM/YYYY&to=DD/MM/YYYY",
           "GET /api/upcoming?from=DD/MM/YYYY&to=DD/MM/YYYY",
           "GET /api/stats/:gameId",
           "GET /api/standings?comp=113|116|5518|115|102|389",
-          "GET /api/sf/live",
-          "GET /api/sf/scheduled?date=YYYY-MM-DD",
-          "GET /api/sf/event/:id[/:sub]",
-          "GET /api/_debug?u=<url>",
+          "GET /api/sf/live", "GET /api/sf/scheduled?date=YYYY-MM-DD",
+          "GET /api/sf/event/:id[/:sub]", "GET /api/_debug?u=<url>",
         ],
       });
     }
 
-    // ── Debug (apenas em desenvolvimento ou via flag) ─────
     if (route === "/_debug") {
-      const targetUrl = q.u ? decodeURIComponent(q.u).slice(0, 500) : "";
-      const r = await produceDebug(targetUrl);
+      const r = await produceDebug(q.u ? decodeURIComponent(q.u).slice(0, 500) : "");
       return send(res, r.status, r.body);
     }
 
-    // ── Ao vivo ───────────────────────────────────────────
     if (route === "/live") {
       const r = await withCache(cacheKey, TTL.live, produceLive);
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Resultados ────────────────────────────────────────
     if (route === "/results") {
-      const from = q.from || "";
-      const to   = q.to   || "";
-      if ((from && !VALID_FROM.test(from)) || (to && !VALID_FROM.test(to))) {
+      const from = q.from || "", to = q.to || "";
+      if ((from && !VALID_FROM.test(from)) || (to && !VALID_FROM.test(to)))
         return send(res, 400, { error: "invalid_date_format", expected: "DD/MM/YYYY" });
-      }
       const ttl = (from && to) ? TTL.resultsHistorical : TTL.results;
       const r = await withCache(cacheKey, ttl, () => produceResults(from, to));
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Próximos jogos ────────────────────────────────────
     if (route === "/upcoming") {
-      const from = q.from || "";
-      const to   = q.to   || "";
-      if ((from && !VALID_FROM.test(from)) || (to && !VALID_FROM.test(to))) {
+      const from = q.from || "", to = q.to || "";
+      if ((from && !VALID_FROM.test(from)) || (to && !VALID_FROM.test(to)))
         return send(res, 400, { error: "invalid_date_format", expected: "DD/MM/YYYY" });
-      }
       const r = await withCache(cacheKey, TTL.upcoming, () => produceUpcoming(from, to));
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Estatísticas de jogo ──────────────────────────────
     if (segs[0] === "stats" && segs[1]) {
       const gameId = segs[1];
       if (!VALID_ID.test(gameId)) return send(res, 400, { error: "invalid_game_id" });
@@ -495,22 +537,19 @@ export default async function handler(req, res) {
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Classificação ─────────────────────────────────────
     if (route === "/standings") {
       const comp = String(q.comp || "113");
       if (!VALID_COMP.test(comp)) return send(res, 400, { error: "invalid_comp_id" });
-      if (!COMPETITIONS[Number(comp)]) return send(res, 400, { error: "unknown_competition", valid: Object.keys(COMPETITIONS) });
+      if (!COMPETITIONS[Number(comp)]) return send(res, 400, { error: "unknown_competition" });
       const r = await withCache(cacheKey, TTL.standings, () => produceStandings(comp));
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Sofascore: ao vivo ────────────────────────────────
     if (route === "/sf/live") {
       const r = await withCache(cacheKey, TTL.sfLive, produceSfLive);
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Sofascore: agenda ─────────────────────────────────
     if (route === "/sf/scheduled") {
       const date = String(q.date || todayBR());
       if (!VALID_DATE.test(date)) return send(res, 400, { error: "invalid_date", expected: "YYYY-MM-DD" });
@@ -518,24 +557,21 @@ export default async function handler(req, res) {
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── Sofascore: evento ─────────────────────────────────
     if (segs[0] === "sf" && segs[1] === "event" && segs[2]) {
-      const sfId = segs[2];
-      const sub  = segs[3] || "";
+      const sfId = segs[2], sub = segs[3] || "";
       if (!VALID_ID.test(sfId)) return send(res, 400, { error: "invalid_event_id" });
       const VALID_SUBS = ["", "statistics", "momentum", "featured-odds", "h2h", "lineups", "incidents"];
-      if (sub && !VALID_SUBS.includes(sub)) return send(res, 400, { error: "invalid_sub_resource", valid: VALID_SUBS });
+      if (sub && !VALID_SUBS.includes(sub)) return send(res, 400, { error: "invalid_sub_resource" });
       const r = await withCache(cacheKey, TTL.sfEvent, () => produceSfEvent(sfId, sub));
       return send(res, r.status ?? 200, r.body, { "X-Cache": r._cache });
     }
 
-    // ── 404 ───────────────────────────────────────────────
-    return send(res, 404, { error: "not_found", route, hint: "Ver /api/health para rotas disponíveis" });
+    return send(res, 404, { error: "not_found", route, hint: "Ver /api/health" });
 
   } catch (err) {
-    log("error", "handler_crash", { route, err: err?.message, stack: err?.stack?.slice(0, 300) });
+    log("error", "handler_crash", { route, err: err?.message });
     return send(res, 500, { error: "internal_error" });
   } finally {
-    log("info", "response", { route, ms: Date.now() - t0 });
+    log("info", "res", { route, ms: Date.now() - t0 });
   }
 }
