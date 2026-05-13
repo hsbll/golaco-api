@@ -170,9 +170,9 @@ function patchGame(row) {
     const m = parseInt(row.minute);
     if (!isNaN(m) && m >= 0) g.gameTime = m;
   }
-  // Status: força consistência entre banco e raw
-  if (row.status === 'live') g.statusGroup = 4; // live em andamento
-  if (row.status === 'finished') g.statusGroup = 4; // encerrado
+  // Status: NÃO sobrescreve statusGroup do raw para live (raw já tem o valor correto da 365scores)
+  // Para finished, força statusGroup=4 (Fim) caso raw esteja desatualizado
+  if (row.status === 'finished') g.statusGroup = 4;
   return g;
 }
 
