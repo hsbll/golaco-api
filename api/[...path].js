@@ -157,22 +157,22 @@ async function sbQuery(path) {
 // ── Patch de jogos: sobrescreve score/status do banco no raw ─
 // O raw pode estar desatualizado — o banco tem o valor mais recente
 function patchGame(row) {
-  const g = { ...row.raw };  // copia o objeto original da 365scores
-  // Sobrescreve com os valores mais atuais gravados pelo collect-live
-  if (row.home_score !== null && row.home_score !== undefined) {
+  const g = { ...row.raw };
+  // Score: ignora -1 (jogo não iniciado) e usa o valor do banco só se válido
+  if (row.home_score !== null && row.home_score !== undefined && row.home_score >= 0) {
     if (g.homeCompetitor) g.homeCompetitor = { ...g.homeCompetitor, score: row.home_score };
   }
-  if (row.away_score !== null && row.away_score !== undefined) {
+  if (row.away_score !== null && row.away_score !== undefined && row.away_score >= 0) {
     if (g.awayCompetitor) g.awayCompetitor = { ...g.awayCompetitor, score: row.away_score };
   }
-  // Injeta minuto atualizado como gameTime
-  if (row.minute && row.minute !== "INTERVALO") {
+  // Minuto: ignora valores inválidos
+  if (row.minute && row.minute !== 'INTERVALO' && row.minute !== "-1'") {
     const m = parseInt(row.minute);
-    if (!isNaN(m)) g.gameTime = m;
+    if (!isNaN(m) && m >= 0) g.gameTime = m;
   }
-  // Garante que statusId ao vivo seja consistente com o status do banco
-  if (row.status === "live" && g.statusGroup !== 6) g.statusGroup = 6;
-  if (row.status === "finished" && g.statusGroup !== 4) g.statusGroup = 4;
+  // Status: força consistência entre banco e raw
+  if (row.status === 'live') g.statusGroup = 4; // live em andamento
+  if (row.status === 'finished') g.statusGroup = 4; // encerrado
   return g;
 }
 
