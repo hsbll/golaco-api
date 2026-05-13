@@ -1,12 +1,6 @@
 // ============================================================
 //  Golaço API — Vercel Serverless v5.0
-//  Fonte primária: Supabase (banco)
-//  Fallback: 365scores (quando banco vazio ou falhar)
-//
-//  Variáveis de ambiente necessárias no Vercel:
-//    SUPABASE_URL          = https://tdrpigbhbwosairjuzdq.supabase.co
-//    SUPABASE_SERVICE_KEY  = eyJhbGci... (service_role key)
-//    ALLOWED_ORIGIN        = * (ou domínio específico)
+
 // ============================================================
 
 // ── Competições ───────────────────────────────────────────
